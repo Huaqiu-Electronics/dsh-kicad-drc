@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto'
 import { basename } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parseDrcSummary, formatSummaryText, type DrcSummary, type JsonValue } from './drc-summary.ts'
+import { DRC_SKILL_NAME } from './skills.ts'
 import {
   onlyLockedRulesEnabled,
   type BackendHealth,
@@ -80,34 +81,19 @@ export function createDrcTool(
   return defineTool({
     name: TOOL_NAME,
     description:
-      '对 KiCad PCB 文件执行 DRC（设计规则检查）。\n\n'
-      + '【工作原理】三种后端执行方式不同：\n\n'
-      + '  - local / ipc：直接跑 kicad-cli pcb drc <pcb文件> --output drc.json --format json --severity-all --refill-zones\n'
-      + '  - remote：把 pcb 文件 multipart 上传到 pcblint DRC 服务（POST /api/s/upload → POST /api/s/lint-drc），\n'
-      + '    由服务端运行「语义规则引擎（NATIVE）+ 本地 kicad-cli 原生检查（EDA_DRC）」并合并返回\n\n'
-      + '三种后端（mode 参数可强制指定，默认 auto 自动选择）：\n'
-      + '  - local:  本地 subprocess 直接调 kicad-cli（需本机安装 KiCad；'
-      + '可执行文件按 插件配置 → 环境变量 KICAD_CLI_PATH → PATH → Windows 注册表 → 常见安装目录 自动探测）。'
-      + '约 1~2 秒，且能读取工程级规则，但只有在 remote 不可用或失败时才会被选到\n'
-      + '  - remote: 上传到 pcblint 服务执行（本机无需 KiCad）。约 3~10 秒；'
-      + '除 kicad-cli 原生检查外还会跑服务端规则引擎，每条违规带 confidence（HIGH/MEDIUM/LOW）与 ruleId；'
-      + '只上传单个 .kicad_pcb，工程级规则（.kicad_pro）带不过去，因此违规数通常与 local 不同。'
-      + '⚠️ pcblint 新版默认只启用被锁定的 clearance（59 条内置规则里其余 58 条关闭）——'
-      + '结果里主要是服务端自研规则；'
-      + '要检查其他内置项（silk_edge_clearance、lib_footprint_issues 等）必须用 drcRules 参数显式打开；'
-      + '内置规则走 kicad-cli 通道，服务端 kicad-cli 跑不起来时打开也不会有新条目\n'
-      + '  - ipc:   让正在运行的 KiCad 直接执行（需要华秋定制版 KiCad 提供 RunDrc）\n\n'
-      + 'auto 模式先按固定优先序列分层（默认 remote → local → ipc），前一层不可用或执行失败才降级；'
-      + '同一层内才按历史耗时排序，所以 local 更快也不会插队抢在 remote 前面。'
-      + '失败会自动回退到下一个，并在结果的 verifiedBy 字段标注实际执行的后端。'
-      + '同一块板在会话内会保持在首次成功的后端上，保证多次结果可比。\n\n'
-      + '传入 .kicad_pcb 文件的绝对路径（文件必须存在于本机文件系统），'
-      + '工具返回 stdout、drcSummary（错误/警告数量、按类型分类、示例错误等）'
-      + '和 drcJsonPath（完整报告持久化在 PCB 文件同目录，可直接读取该文件查看明细）。'
-      + '报告格式由 reportFormat 标明：kicad-cli（原生，severity 小写）或 pcblint（severity 大写 + confidence），两种格式的数字不可直接比较。'
-      + '如果只关心概况，优先读 drcSummary；需要完整明细时传 includeFullJson=true 或直接读 drcJsonPath 指向的文件。\n\n'
-      + '【注意】默认输出不含原始 JSON（可能数百 KB），避免撑爆上下文。'
-      + 'success 表示 DRC 运行是否正常完成，不代表板子没有违规——有无违规请判断 drcSummary.totalIssues。',
+      '对 KiCad PCB 文件执行 DRC（设计规则检查），返回结构化结果与报告文件路径。\n\n'
+      + '调用规则：pcbPath 必须是本机存在的 .kicad_pcb 绝对路径；mode 留空为 auto'
+      + '（按 remote → local → ipc 分层，前一层不可用或失败才降级），显式指定则该后端失败即报错、不回退。\n\n'
+      + '结果判读（以输出 schema 的字段为准，不得自行推断）：\n'
+      + '  - success 只表示 DRC 运行完成，不代表板子没有违规；有无违规看 drcSummary.totalIssues。\n'
+      + '  - reportComplete=false 时报告不完整，不能当完整 DRC 结论，也不能与 local 的条数比较；按 reportIncomplete 区分原因。\n'
+      + '  - 跨后端 / 跨 reportFormat 的违规数不可直接比较，比较前先看 verifiedBy。\n'
+      + '  - projectRules.status 为 skipped/failed 时按服务端默认工程判定，线宽/间距类结论不可直接采信。\n'
+      + '  - 默认不返回原始 drc.json；需要明细读 drcJsonPath 或传 includeFullJson=true。\n\n'
+      + '行为契约：以结构化工具结果为权威，不编造违规数、连通性、库信息或 DRC 通过；'
+      + '信息拿不到时如实报告，不把任务已提交/运行中当成完成。\n\n'
+      + '需要后端选型、drcRules 内置规则口径、失败/回退排查或完整结果解读流程时，'
+      + `加载 skill \`${DRC_SKILL_NAME}\`；常规跑一次 DRC 并读结果无需加载。`,
 
     parameters: {
       pcbPath: {
@@ -118,12 +104,9 @@ export function createDrcTool(
       mode: {
         type: 'string',
         description:
-          `执行后端。默认 ${defaultMode}（auto 按优先序列选择：默认 remote → local → ipc，`
-          + '前一个不可用或执行失败才降级到下一个）；'
-          + 'local 强制本地 kicad-cli；remote 强制走 pcblint 服务（语义规则 + 原生检查）；'
-          + 'ipc 直接让正在运行的 KiCad 执行 DRC 并取回结构化结果'
-          + '（作用于未保存的板、不产生 marker，需要华秋定制版 KiCad）。'
-          + '需要可复现的固定环境时显式指定，其余情况留空即可。',
+          `执行后端：auto / local / remote / ipc，默认 ${defaultMode}。`
+          + '显式指定时该后端失败即报错、不回退；各后端差异与选型见 '
+          + `skill \`${DRC_SKILL_NAME}\`。`,
       },
       severityAll: {
         type: 'boolean',
@@ -141,11 +124,10 @@ export function createDrcTool(
         type: 'string',
         description:
           'KiCad 内置规则开关，格式 "key=severity,key=severity"（severity ∈ error/warning/ignore），'
-          + '如 "silk_edge_clearance=error,unconnected_items=ignore"。仅 remote 后端生效：'
-          + 'pcblint 新版默认只启用被锁定的 clearance，其余内置规则关闭，需要它们的违规时必须在这里显式打开；'
-          + '未提到的 key 保持服务端当前值（开关按板持久化，不传是沿用上次而非回到默认），'
-          + '锁定的 key（DRU 依赖的约束类型）由服务端忽略。'
-          + '只想看某几类问题时用它收窄口径，不要与 local 的全量结果直接比数字。',
+          + '如 "silk_edge_clearance=error,unconnected_items=ignore"。仅 remote 生效；'
+          + 'remote 默认只启用被锁定的内置规则，需要其它检查项时必须在此显式打开。'
+          + '未提到的 key 沿用服务端当前值；完整口径与内置规则陷阱见 '
+          + `skill \`${DRC_SKILL_NAME}\`。`,
       },
       includeFullJson: {
         type: 'boolean',
@@ -482,11 +464,10 @@ export function createBackendsTool(
   return defineTool({
     name: BACKENDS_TOOL_NAME,
     description:
-      '列出 KiCad DRC 的可用执行后端及其状态（不执行 DRC，也不产生副作用）。\n\n'
-      + '返回每个后端的 available、endpoint、预计耗时 estimatedMs 与不可用原因。'
-      + '典型用途：跑 DRC 前确认本机是否有可用的本地 kicad-cli；'
-      + '或在上一次远程调用失败后确认它是否处于降级冷却期。'
-      + '一般情况下直接调用 kicad_drc_run（mode 留空）即可，无需先调本工具。',
+      '列出 KiCad DRC 执行后端的状态（available / endpoint / estimatedMs / reason），不执行 DRC、无副作用。'
+      + '一般直接调用 kicad_drc_run（mode 留空）即可；仅在需要确认本机 kicad-cli 是否可用、'
+      + '或远程调用失败后确认降级冷却期时使用。'
+      + `后端详情见 skill \`${DRC_SKILL_NAME}\`。`,
     parameters: {},
     output: {
       schema: {

@@ -38,6 +38,7 @@ import {
   IPC_PYTHON_ENV,
 } from './config.ts'
 import { createDrcTool, createBackendsTool, TOOL_NAME, BACKENDS_TOOL_NAME } from './tools.ts'
+import { registerDrcSkill } from './skills.ts'
 import { createReportRegistry, createDrcReportHandler } from './web-routes.ts'
 import { createDrcService, DRC_SERVICE_NAME } from './service.ts'
 import type { DrcExecutor, DrcMode, DrcBackendName } from './executor.ts'
@@ -179,7 +180,13 @@ export const Config: Schema<Config> = Schema.object({
 /** 插件名，Cordis 会显示。 */
 export const name = '@huaqiu/dsh-kicad-drc'
 
-/** 依赖的 DSH 服务（webServer 用于 /drc-report 报告查看路由；headless 环境缺失时自动降级）。 */
+/**
+ * 依赖的 DSH 服务（webServer 用于 /drc-report 报告查看路由；headless 环境缺失时自动降级）。
+ *
+ * kicad-drc 任务指引**不**放进 inject：cordis 的 inject 项全是 required，服务缺失会
+ * 挂起整个插件，连 DRC 工具都注册不上。改用 ctx.get('skills') 可选查找，能力缺失
+ * 只影响指引，不影响既有功能。
+ */
 export const inject = ['tools', 'webServer']
 
 /** 已打印过的进度档位，按阶段记录，避免同一档位被每个数据块重复打印。 */
@@ -361,6 +368,17 @@ export function apply(ctx: Context, config: Config): void {
 
   registry.register(drcTool)
   registry.register(backendsTool)
+
+  // 任务指引走 skills 懒加载：不进系统提示词、也不进工具 schema。
+  // 放在工具注册之后并整体兜底，确保指引注册失败绝不影响 DRC 工具可用性。
+  try {
+    registerDrcSkill(ctx)
+  } catch (e) {
+    console.warn(
+      `[@huaqiu/dsh-kicad-drc] kicad-drc 任务指引注册异常（DRC 工具不受影响）: `
+      + `${e instanceof Error ? e.message : String(e)}`,
+    )
+  }
 
   ctx.effect(() => {
     console.log(`[@huaqiu/dsh-kicad-drc] 已注册工具: ${TOOL_NAME}, ${BACKENDS_TOOL_NAME}`)
